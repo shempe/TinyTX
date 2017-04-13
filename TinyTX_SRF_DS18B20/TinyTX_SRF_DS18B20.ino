@@ -1,8 +1,10 @@
 //----------------------------------------------------------------------------------------------------------------------
-// TinyTX - An ATtiny84 and RFM12B Wireless Temperature Sensor Node
+// TinyTX - An ATtiny84 and Ciseco SRF Wireless Temperature Sensor Node
 // By Nathan Chantrell. For hardware design see http://nathan.chantrell.net/tinytx
 //
 // Using the Dallas DS18B20 temperature sensor
+// and Ciseco SRF Radio: http://shop.ciseco.co.uk/srf-wireless-rf-radio-surface-mount/
+// SRF is set to sleep mode 2, see http://zorg.org/cuy
 //
 // Licenced under the Creative Commons Attribution-ShareAlike 3.0 Unported (CC BY-SA 3.0) licence:
 // http://creativecommons.org/licenses/by-sa/3.0/
@@ -13,79 +15,37 @@
 
 #include <OneWire.h> // http://www.pjrc.com/teensy/arduino_libraries/OneWire.zip
 #include <DallasTemperature.h> // http://download.milesburton.com/Arduino/MaximTemperature/DallasTemperature_LATEST.zip
-#include <JeeLib.h> // https://github.com/jcw/jeelib
+#include <Narcoleptic.h> // https://code.google.com/p/narcoleptic/
+#include <SoftEasyTransfer.h> // https://github.com/madsci1016/Arduino-EasyTransfer/tree/master/SoftEasyTransfer
+#include <SoftwareSerial.h>
 
-ISR(WDT_vect) { Sleepy::watchdogEvent(); } // interrupt handler for JeeLabs Sleepy power saving
-
-#define myNodeID 1        // RF12 node ID in the range 1-30
-#define network 210       // RF12 Network group
-#define freq RF12_433MHZ  // Frequency of RFM12B module
-
-#define USE_ACK           // Enable ACKs, comment out to disable
-#define RETRY_PERIOD 5    // How soon to retry (in seconds) if ACK didn't come in
-#define RETRY_LIMIT 5     // Maximum number of times to retry
-#define ACK_TIME 10       // Number of milliseconds to wait for an ack
+#define myNodeID 99       // node ID in the range 0-255
+#define TX_PIN 2          // SRF DIN pin is connected to D2
+#define RX_PIN 0          // SRF DOUT pin is connected to D0 (currently not used)
+#define SLEEP_PIN 1       // SRF SLEEP pin is connected to D1
 
 #define ONE_WIRE_BUS 10   // DS18B20 Temperature sensor is connected on D10/ATtiny pin 13
 #define ONE_WIRE_POWER 9  // DS18B20 Power pin is connected on D9/ATtiny pin 12
 
+SoftwareSerial srf(RX_PIN, TX_PIN); // RX, TX
+
 OneWire oneWire(ONE_WIRE_BUS); // Setup a oneWire instance
 
 DallasTemperature sensors(&oneWire); // Pass our oneWire reference to Dallas Temperature
+
+SoftEasyTransfer ET;  // Create SoftEasyTransfer object
 
 //########################################################################################################################
 //Data Structure to be sent
 //########################################################################################################################
 
  typedef struct {
-  	  int temp;	// Temperature reading
+  	  byte nodeID;	// Sensor Node ID in the range 0 to 255
+   	  int temp;	// Temperature reading
   	  int supplyV;	// Supply voltage
  } Payload;
 
  Payload tinytx;
-
-// Wait a few milliseconds for proper ACK
- #ifdef USE_ACK
-  static byte waitForAck() {
-   MilliTimer ackTimer;
-   while (!ackTimer.poll(ACK_TIME)) {
-     if (rf12_recvDone() && rf12_crc == 0 &&
-        rf12_hdr == (RF12_HDR_DST | RF12_HDR_CTL | myNodeID))
-        return 1;
-     }
-   return 0;
-  }
- #endif
-
-//--------------------------------------------------------------------------------------------------
-// Send payload data via RF
-//-------------------------------------------------------------------------------------------------
- static void rfwrite(){
-  #ifdef USE_ACK
-   for (byte i = 0; i <= RETRY_LIMIT; ++i) {  // tx and wait for ack up to RETRY_LIMIT times
-     rf12_sleep(-1);              // Wake up RF module
-      while (!rf12_canSend())
-      rf12_recvDone();
-      rf12_sendStart(RF12_HDR_ACK, &tinytx, sizeof tinytx); 
-      rf12_sendWait(2);           // Wait for RF to finish sending while in standby mode
-      byte acked = waitForAck();  // Wait for ACK
-      rf12_sleep(0);              // Put RF module to sleep
-      if (acked) { return; }      // Return if ACK received
-  
-   Sleepy::loseSomeTime(RETRY_PERIOD * 1000);     // If no ack received wait and try again
-   }
-  #else
-     rf12_sleep(-1);              // Wake up RF module
-     while (!rf12_canSend())
-     rf12_recvDone();
-     rf12_sendStart(0, &tinytx, sizeof tinytx); 
-     rf12_sendWait(2);           // Wait for RF to finish sending while in standby mode
-     rf12_sleep(0);              // Put RF module to sleep
-     return;
-  #endif
- }
-
-
 
 //--------------------------------------------------------------------------------------------------
 // Read current supply voltage
@@ -112,10 +72,14 @@ DallasTemperature sensors(&oneWire); // Pass our oneWire reference to Dallas Tem
 
 void setup() {
 
-  rf12_initialize(myNodeID,freq,network); // Initialize RFM12 with settings defined above 
-  rf12_sleep(0);                          // Put the RFM12 to sleep
-
+  srf.begin(9600); // initialize serial communication with the SRF at 9600 bits per second:
+  
+  ET.begin(details(tinytx), &srf); // initialize SoftEasyTransfer
+  
+  tinytx.nodeID = myNodeID; // set nodeID
+  
   pinMode(ONE_WIRE_POWER, OUTPUT); // set power pin for DS18B20 to output
+  pinMode(SLEEP_PIN, OUTPUT);      // set sleep pin for SRF to output
   
   PRR = bit(PRTIM1); // only keep timer 0 going
   
@@ -127,8 +91,7 @@ void loop() {
   
   digitalWrite(ONE_WIRE_POWER, HIGH); // turn DS18B20 sensor on
 
-  //Sleepy::loseSomeTime(5); // Allow 5ms for the sensor to be ready
-  delay(5); // The above doesn't seem to work for everyone (why?)
+  delay(5); // Allow 5ms for the sensor to be ready
  
   sensors.begin(); //start up temp sensor
   sensors.requestTemperatures(); // Get the temperature
@@ -138,9 +101,16 @@ void loop() {
   
   tinytx.supplyV = readVcc(); // Get supply voltage
 
-  rfwrite(); // Send data via RF 
+  digitalWrite(SLEEP_PIN, LOW);      // turn SRF on
+  
+  delay(10); // Allow 10ms for the srf to be ready
+  
+  ET.sendData(); // Send data via RF 
 
-  Sleepy::loseSomeTime(60000); //JeeLabs power save function: enter low power mode for 60 seconds (valid range 16-65000 ms)
+  digitalWrite(SLEEP_PIN, HIGH);     // turn SRF off
 
+  Narcoleptic.delay(60000); // enter low power mode for 60 seconds, valid range 16-32000 ms with standard Narcoleptic lib
+                            // change variable for delay from int to unsigned int in Narcoleptic.cpp and Narcoleptic.h
+                            // to extend range up to 65000 ms
 }
 

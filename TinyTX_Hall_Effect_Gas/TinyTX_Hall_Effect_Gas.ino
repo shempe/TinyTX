@@ -1,11 +1,11 @@
 //----------------------------------------------------------------------------------------------------------------------
-// TinyTX_TMP36 - An ATtiny84 and RFM12B Wireless Temperature Sensor Node
+// TinyTX_Hall_Effect_Gas - An ATtiny84 Gas Usage Monitoring Node
 // By Nathan Chantrell. For hardware design see http://nathan.chantrell.net/tinytx
 //
-// **IMPORTANT** Note that the TMP36 must be fitted in the REVERSE orientation compared to the DS18B20
-// and do not fit a resistor
+// Simplified version, sends whenever there is a new pulse.
 //
-// Using the Analog Devices TMP36 temperature sensor
+// Using an A3214EUA-T or A3213EUA-T Hall Effect Sensor
+// Power (pin 1) of sensor to D9, output (pin 3) to D10, 0.1uF capactior across power & ground
 //
 // Licenced under the Creative Commons Attribution-ShareAlike 3.0 Unported (CC BY-SA 3.0) licence:
 // http://creativecommons.org/licenses/by-sa/3.0/
@@ -15,34 +15,34 @@
 
 #include <JeeLib.h> // https://github.com/jcw/jeelib
 
-ISR(WDT_vect) { Sleepy::watchdogEvent(); } // interrupt handler for JeeLabs Sleepy power saving
-
-#define myNodeID 1      // RF12 node ID in the range 1-30
-#define network 210      // RF12 Network group
-#define freq RF12_433MHZ // Frequency of RFM12B module
+#define myNodeID 9        // RF12 node ID in the range 1-30
+#define network 210       // RF12 Network group
+#define freq RF12_433MHZ  // Frequency of RFM12B module
 
 #define USE_ACK           // Enable ACKs, comment out to disable
 #define RETRY_PERIOD 5    // How soon to retry (in seconds) if ACK didn't come in
 #define RETRY_LIMIT 5     // Maximum number of times to retry
 #define ACK_TIME 10       // Number of milliseconds to wait for an ack
 
-#define tempPin A0       // TMP36 Vout connected to A0/ATtiny pin 13
-#define tempPower 9      // TMP36 Power pin is connected on pin D9/ATtiny pin 12
+#define powerPin 9        // Sensors power pin is on D9 (ATtiny pin 12)
+#define sensorPin 10      // Sensors data pin is on D10 (ATtiny pin 13)
 
-int tempReading;         // Analogue reading from the sensor
-
-//########################################################################################################################
+byte lastPulse = 0;       // Last reading from sensor
+ 
+//--------------------------------------------------------------------------------------------------
 //Data Structure to be sent
-//########################################################################################################################
+//--------------------------------------------------------------------------------------------------
 
  typedef struct {
-  	  int temp;	// Temperature reading
+  	  int gas;	// Pulses since last TX
   	  int supplyV;	// Supply voltage
  } Payload;
 
  Payload tinytx;
-
-// Wait a few milliseconds for proper ACK
+ 
+//--------------------------------------------------------------------------------------------------
+// Wait for an ACK
+//--------------------------------------------------------------------------------------------------
  #ifdef USE_ACK
   static byte waitForAck() {
    MilliTimer ackTimer;
@@ -69,7 +69,7 @@ int tempReading;         // Analogue reading from the sensor
       byte acked = waitForAck();  // Wait for ACK
       rf12_sleep(0);              // Put RF module to sleep
       if (acked) { return; }      // Return if ACK received
-  
+      
    Sleepy::loseSomeTime(RETRY_PERIOD * 1000);     // If no ack received wait and try again
    }
   #else
@@ -77,13 +77,11 @@ int tempReading;         // Analogue reading from the sensor
      while (!rf12_canSend())
      rf12_recvDone();
      rf12_sendStart(0, &tinytx, sizeof tinytx); 
-     rf12_sendWait(2);           // Wait for RF to finish sending while in standby mode
-     rf12_sleep(0);              // Put RF module to sleep
+     rf12_sendWait(2);            // Wait for RF to finish sending while in standby mode
+     rf12_sleep(0);               // Put RF module to sleep
      return;
   #endif
  }
-
-
 
 //--------------------------------------------------------------------------------------------------
 // Read current supply voltage
@@ -106,53 +104,39 @@ int tempReading;         // Analogue reading from the sensor
    ADCSRA &= ~ bit(ADEN); bitSet(PRR, PRADC); // Disable the ADC to save power
    return result;
 } 
+    
 //########################################################################################################################
 
 void setup() {
+  
+  ADCSRA &= ~ bit(ADEN); bitSet(PRR, PRADC); // Disable the ADC to save power
 
   rf12_initialize(myNodeID,freq,network); // Initialize RFM12 with settings defined above 
   rf12_sleep(0);                          // Put the RFM12 to sleep
 
-  analogReference(INTERNAL);  // Set the aref to the internal 1.1V reference
- 
-  pinMode(tempPower, OUTPUT); // set power pin for TMP36 to output
- 
+  pinMode(powerPin, OUTPUT);     // set power pin as output
+  digitalWrite(powerPin, HIGH);  // and set high
+
+  pinMode(sensorPin, INPUT);     // set sensor pin as input
+  digitalWrite(sensorPin, HIGH); // and turn on pullup
+  
 }
 
 void loop() {
   
-  digitalWrite(tempPower, HIGH); // turn TMP36 sensor on
+  byte newPulse = digitalRead(sensorPin);  // Read sensor pin
 
-  delay(10); // Allow 10ms for the sensor to be ready
- 
-  bitClear(PRR, PRADC); ADCSRA |= bit(ADEN); // Enable the ADC
+  if (newPulse == 0 && lastPulse == 1) { // New pulse detected
 
-  analogRead(tempPin); // throw away the first reading
+    tinytx.gas = 1;  // Each pulse = 0.01 m3/pulse, multiply by 0.01 at receiving end.
 
-  ADCSRA &= ~ bit(ADEN); bitSet(PRR, PRADC); // Disable the ADC to save power
-  
-  for(int i = 0; i < 10 ; i++) // take 10 more readings
-  {
-   tempReading += analogRead(tempPin); // accumulate readings
-  }
-  tempReading = tempReading / 10 ; // calculate the average
+    tinytx.supplyV = readVcc(); // Get supply voltage
 
-  digitalWrite(tempPower, LOW); // turn TMP36 sensor off
-
-//  double voltage = tempReading * (1100/1024); // Convert to mV (assume internal reference is accurate)
-  
-  double voltage = tempReading * 0.942382812; // Calibrated conversion to mV
-
-  double temperatureC = (voltage - 500) / 10; // Convert to temperature in degrees C. 
-
-  tinytx.temp = temperatureC * 100; // Convert temperature to an integer, reversed at receiving end
-  
-  tinytx.supplyV = readVcc(); // Get supply voltage
-
-  rfwrite(); // Send data via RF 
-
-  Sleepy::loseSomeTime(60000); //JeeLabs power save function: enter low power mode for 60 seconds (valid range 16-65000 ms)
+    rfwrite(); // Send data via RF    
     
-}
+  } 
+  
+  lastPulse = newPulse;
 
+}
 
